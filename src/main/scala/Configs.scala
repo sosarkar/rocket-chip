@@ -28,7 +28,7 @@ class DefaultConfig extends Config (
       new AddrMap(deviceTree +: csrs :+ scr)
     }
     def makeDeviceTree() = {
-      val addrMap = new AddrHashMap(site(GlobalAddrMap))
+      val addrMap = new AddrHashMap(site(GlobalAddrMap), site(MMIOBase))
       val devices = site(GlobalDeviceSet)
       val dt = new DeviceTreeGenerator
       dt.beginNode("")
@@ -89,8 +89,8 @@ class DefaultConfig extends Config (
       case MIFTagBits => // Bits needed at the L2 agent
                          log2Up(site(NAcquireTransactors)+2) +
                          // Bits added by NASTI interconnect
-                         log2Up(site(NMemoryChannels) * site(NBanksPerMemoryChannel) +
-                                (if (site(UseDma)) 2 else 1))
+                         max(log2Up(site(NBanksPerMemoryChannel)),
+                            (if (site(UseDma)) 3 else 2))
       case MIFDataBits => 64
       case MIFAddrBits => site(PAddrBits) - site(CacheBlockOffsetBits)
       case MIFDataBeats => site(CacheBlockBytes) * 8 / site(MIFDataBits)
@@ -132,7 +132,6 @@ class DefaultConfig extends Config (
       case StoreDataQueueDepth => 17
       case ReplayQueueDepth => 16
       case NMSHRs => Knob("L1D_MSHRS")
-      case NIOMSHRs => 1
       case LRSCCycles => 32 
       //L2 Memory System Params
       case NAcquireTransactors => 7
@@ -153,11 +152,12 @@ class DefaultConfig extends Config (
       }
       case BuildRoCC => Nil
       case RoccNMemChannels => site(BuildRoCC).map(_.nMemChannels).foldLeft(0)(_ + _)
+      case RoccNCSRs => site(BuildRoCC).map(_.nCSRs).foldLeft(0)(_ + _)
       case UseDma => false
       case UseStreamLoopback => false
       case NDmaTransactors => 3
+      case NDmaXacts => site(NDmaTransactors) * site(NTiles)
       case NDmaClients => site(NTiles)
-      case NDmaXactsPerClient => site(NDmaTransactors)
       //Rocket Core Constants
       case FetchWidth => 1
       case RetireWidth => 1
@@ -187,17 +187,17 @@ class DefaultConfig extends Config (
       case TLKey("L1toL2") => 
         TileLinkParameters(
           coherencePolicy = new MESICoherence(site(L2DirectoryRepresentation)),
-          nManagers = site(NBanksPerMemoryChannel)*site(NMemoryChannels),
+          nManagers = site(NBanksPerMemoryChannel)*site(NMemoryChannels) + 1,
           nCachingClients = site(NTiles),
           nCachelessClients = (if (site(UseDma)) 2 else 1) +
                               site(NTiles) *
                                 (1 + (if(site(BuildRoCC).isEmpty) 0
                                       else site(RoccNMemChannels))),
-          maxClientXacts = max(site(NMSHRs) + site(NIOMSHRs),
+          maxClientXacts = max(site(NMSHRs) + 1,
                                max(if (site(BuildRoCC).isEmpty) 1 else site(RoccMaxTaggedMemXacts),
                                    if (site(UseDma)) 4 else 1)),
           maxClientsPerPort = max(if (site(BuildRoCC).isEmpty) 1 else 2,
-                                  if (site(UseDma)) site(NDmaTransactors) else 1),
+                                  if (site(UseDma)) site(NDmaTransactors) + 1 else 1),
           maxManagerXacts = site(NAcquireTransactors) + 2,
           dataBits = site(CacheBlockBytes)*8)
       case TLKey("L2toMC") => 
@@ -225,7 +225,6 @@ class DefaultConfig extends Config (
       case GlobalAddrMap => {
         val extraSize = site(ExternalIOStart) - site(MMIOBase)
         AddrMap(
-          AddrMapEntry("mem", None, MemChannels(site(MMIOBase), site(NMemoryChannels), AddrMapConsts.RWX)),
           AddrMapEntry("conf", None, MemSubmap(extraSize / 2, genCsrAddrMap)),
           AddrMapEntry("devices", None, MemSubmap(extraSize / 2, site(GlobalDeviceSet).getAddrMap)),
           AddrMapEntry("io", Some(site(ExternalIOStart)), MemSize(2 * site(MMIOBase), AddrMapConsts.RW)))
@@ -234,6 +233,9 @@ class DefaultConfig extends Config (
         val devset = new DeviceSet
         if (site(UseStreamLoopback)) {
           devset.addDevice("loopback", site(StreamLoopbackWidth) / 8, "stream")
+        }
+        if (site(UseDma)) {
+          devset.addDevice("dma", site(CacheBlockBytes), "dma")
         }
         devset
       }
@@ -403,7 +405,7 @@ class WithDmaController extends Config(
         RoccParameters(
           opcodes = OpcodeSet.custom2,
           generator = (p: Parameters) => Module(new DmaController()(p)),
-          useDma = true))
+          nCSRs = DmaCtrlRegNumbers.NCSRS))
     case RoccMaxTaggedMemXacts => 1
   })
 
@@ -414,7 +416,9 @@ class WithStreamLoopback extends Config(
     case StreamLoopbackWidth => 64
   })
 
-class DmaControllerConfig extends Config(new WithDmaController ++ new DefaultL2Config)
+class DmaControllerConfig extends Config(new WithDmaController ++ new WithStreamLoopback ++ new DefaultL2Config)
+class DualCoreDmaControllerConfig extends Config(new With2Cores ++ new DmaControllerConfig)
+class DmaControllerFPGAConfig extends Config(new WithDmaController ++ new WithStreamLoopback ++ new DefaultFPGAConfig)
 
 class SmallL2Config extends Config(
   new With2MemoryChannels ++ new With4BanksPerMemChannel ++
